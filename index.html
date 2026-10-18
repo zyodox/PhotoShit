@@ -32003,6 +32003,321 @@ var PL_BUILD = 'b261009-pro';
 
   const _refreshProps8 = refreshProps;
   refreshProps = function(){ const r = _refreshProps8.apply(this, arguments); labSync(); return r; };
+  // ================================================================
+  // ==============  TOUCH & PEN  ===================================
+  // Tablets and touchscreens. The canvas tools were written against mouse
+  // events, and a browser only sends those for a finger *tap*, never while a
+  // finger drags -- so on a tablet nothing painted, selected or moved. Here a
+  // touch on a drawing surface is turned into mouse events the moment it lands
+  // (no hold, no wait), so every tool works with a finger exactly as it does
+  // with a mouse. On top of that:
+  //   two fingers on the canvas  pinch to zoom around them, drag to pan
+  //   two-finger tap / three     undo / redo
+  //   long press on the panels   = right-click (slider reset, key easing ...)
+  //   hold a layer row           drag it to reorder
+  //   a pen                      always works, and rests the palm: touches on
+  //                              the canvas are ignored while the pen is in use
+  //   touch mode                 bigger targets, no double-tap delay, no page
+  //                              zoom, and a Shift / Alt / Ctrl / Enter / Esc bar
+  // Self-contained, and uses only parts of the editor every build has.
+  // ================================================================
+  var plTouch = { on:false, mods:{ shift:false, alt:false, ctrl:false }, pts:new Map(), bridge:null, gesture:null,
+                  penAt:0, penNative:null, lastDown:0, lastDownCanvas:false, nativeCM:0, swallowClick:0, lp:null, rowDrag:null };
+
+  (function plTouchSetup(){
+    // No page zoom and no double-tap wait: the canvas zooms itself.
+    const vp = document.querySelector('meta[name=viewport]');
+    if(vp) vp.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover';
+    ['gesturestart', 'gesturechange', 'gestureend'].forEach(t => document.addEventListener(t, e => e.preventDefault(), { passive:false }));
+    const css = document.createElement('style');
+    css.textContent = [
+      'html, body{touch-action:pan-x pan-y; -webkit-tap-highlight-color:transparent;}',
+      'button, select, input, label, a, summary, .tab, .bs-arrow, li{touch-action:manipulation;}',
+      '#canvasArea, #canvasArea *, #cropOverlay, #cropViewport, #eraseOverlay, #eraseViewport, #curvesCanvas, #asideResizer,',
+      '#layersResizer, .tl-clip, .tl-k, .tl-ruler, .tl-cl-h, .tl-grip, .bloom-origin, .text-grip{touch-action:none;}',
+      '.bs-track{touch-action:pan-y;}',
+      '#canvasArea, #stage, #glStage{-webkit-user-select:none; user-select:none; -webkit-touch-callout:none;}',
+      // touch mode: everything a finger has to hit, bigger
+      'html.pl-touch header button{min-height:38px;}',
+      'html.pl-touch header button.icon{min-width:40px;}',
+      'html.pl-touch .tool-rail button{width:44px; height:44px;}',
+      'html.pl-touch .tab-rail .tab{width:42px; height:42px;}',
+      'html.pl-touch .bs-track{height:36px;}',
+      'html.pl-touch .bs-arrow{width:30px;}',
+      'html.pl-touch #layerList li{min-height:52px;}',
+      'html.pl-touch .menu button, html.pl-touch .popover button{min-height:40px;}',
+      'html.pl-touch select, html.pl-touch input[type=text]{min-height:38px;}',
+      'html.pl-touch input[type=checkbox]{width:22px; height:22px;}',
+      'html.pl-touch .tl-row.track{height:60px;} html.pl-touch .tl-row.prop{height:30px;}',
+      'html.pl-touch .tl-k{width:15px; height:15px; margin:-7.5px 0 0 -7.5px;}',
+      'html.pl-touch .tl-cl-h{width:16px;} html.pl-touch .tl-bar button{min-height:34px;}',
+      'html.pl-touch .kfw button{padding:5px 3px;}',
+      '#plTouchBar{position:fixed; left:60px; bottom:34px; z-index:60; display:none; gap:6px; padding:6px;',
+      '  background:rgba(28,28,31,.92); border:1px solid var(--border, #333); border-radius:12px; box-shadow:0 6px 20px rgba(0,0,0,.4);}',
+      'html.pl-touch #plTouchBar{display:flex;}',
+      '#plTouchBar button{min-width:52px; min-height:42px; padding:0 10px; font-size:13px;}',
+      '#plTouchBar button.on{background:var(--accent-dim, rgba(76,141,255,.2)); border-color:var(--accent, #4c8dff); color:var(--text, #fff);}',
+      '#plTouchBar .sep{width:1px; background:var(--line, #333); margin:4px 2px;}',
+      '#layerList li.pl-row-drag{opacity:.55;} #layerList li.pl-row-target{box-shadow:inset 0 2px 0 var(--accent, #4c8dff);}',
+      '#layerList li.pl-row-below{box-shadow:inset 0 -2px 0 var(--accent, #4c8dff);}'
+    ].join('\n');
+    document.head.appendChild(css);
+    // Touch mode turns on with the first touch (or at load on a touch-first device).
+    try { if(matchMedia('(pointer: coarse)').matches) plTouchMode(); } catch(err){}
+  })();
+  function plTouchMode(){
+    if(plTouch.on) return;
+    plTouch.on = true;
+    document.documentElement.classList.add('pl-touch');
+    plTouchBar();
+    window.dispatchEvent(new Event('resize'));
+  }
+
+  // ---------------- on-screen keys ----------------
+  function plTouchBar(){
+    if(document.getElementById('plTouchBar')) return;
+    const bar = document.createElement('div');
+    bar.id = 'plTouchBar';
+    bar.innerHTML = '<button data-m="shift" title="Hold Shift for the next touches (add to selection, constrain)">Shift</button>' +
+      '<button data-m="alt" title="Alt (subtract from selection, clone source)">Alt</button>' +
+      '<button data-m="ctrl" title="Ctrl">Ctrl</button><span class="sep"></span>' +
+      '<button data-k="Enter" title="Confirm (Enter)">✓</button><button data-k="Escape" title="Cancel (Esc)">✕</button>' +
+      '<span class="sep"></span><button data-fit title="Fit the canvas to the window">Fit</button>';
+    document.body.appendChild(bar);
+    bar.addEventListener('click', (e)=>{
+      const b = e.target.closest('button'); if(!b) return;
+      if(b.dataset.m){ plTouch.mods[b.dataset.m] = !plTouch.mods[b.dataset.m]; b.classList.toggle('on', plTouch.mods[b.dataset.m]); }
+      else if(b.dataset.k){
+        const opt = { key:b.dataset.k, code:b.dataset.k, bubbles:true, cancelable:true };
+        window.dispatchEvent(new KeyboardEvent('keydown', opt));
+        window.dispatchEvent(new KeyboardEvent('keyup', opt));
+      } else if(b.hasAttribute('data-fit')) document.getElementById('btnZoomFit').click();
+    });
+  }
+
+  // ---------------- helpers ----------------
+  var PL_BRIDGE = '#canvasArea, #cropOverlay, #eraseOverlay, #curvesCanvas, #asideResizer, #layersResizer, [data-touch-mouse]';
+  function plIsControl(t){ return !!(t && t.closest && t.closest('input, select, textarea, button, a, [contenteditable=""], [contenteditable=true], .bslider, .tl-bar')); }
+  function plFire(type, src, target, buttons){
+    const m = plTouch.mods;
+    const ev = new MouseEvent(type, {
+      bubbles:true, cancelable:true, composed:true, view:window,
+      clientX:src.clientX, clientY:src.clientY, screenX:src.screenX, screenY:src.screenY,
+      button: type === 'contextmenu' ? 2 : 0, buttons, detail: type === 'mousemove' ? 0 : 1,
+      shiftKey: src.shiftKey || m.shift, altKey: src.altKey || m.alt, ctrlKey: src.ctrlKey || m.ctrl, metaKey: src.metaKey
+    });
+    ev.__plTouch = true;
+    (target && target.isConnected ? target : document).dispatchEvent(ev);
+    return ev;
+  }
+  function plUnder(e, fallback){ return document.elementFromPoint(e.clientX, e.clientY) || fallback || document.body; }
+  function plCanvasTouches(){ let n = 0; plTouch.pts.forEach(p => { if(p.canvas) n++; }); return n; }
+
+  // ---------------- the bridge: a finger (or a pen without mouse events) drives the mouse tools ----------------
+  function plBridgeStart(e, kind){
+    plTouch.bridge = { id:e.pointerId, kind, hist:undoStack.length, t0:performance.now(), x0:e.clientX, y0:e.clientY, last:e, target:e.target };
+    plFire('mousedown', e, e.target, 1);
+  }
+  function plBridgeEnd(e, cancelled){
+    const b = plTouch.bridge; if(!b) return;
+    plTouch.bridge = null;
+    plFire('mouseup', e || b.last, plUnder(e || b.last, b.target), 0);
+    return b;
+  }
+
+  // ---------------- two-finger navigation ----------------
+  function plGestureStart(){
+    // A stroke the first finger began a moment ago was the start of this
+    // gesture, not a stroke: end it and take it back.
+    const b = plTouch.bridge;
+    if(b){
+      plBridgeEnd(null, true);
+      if(performance.now() - b.t0 < 400){ while(undoStack.length > b.hist) undo(); }
+    }
+    const P = [...plTouch.pts.values()].filter(p => p.canvas);
+    const a = P[0], c = P[1];
+    const mx = (a.x + c.x)/2, my = (a.y + c.y)/2;
+    const r = zoomOuter.getBoundingClientRect();
+    plTouch.gesture = { d0: Math.hypot(a.x - c.x, a.y - c.y) || 1, z0: zoom, cx:(mx - r.left)/zoom, cy:(my - r.top)/zoom,
+                        mx0:mx, my0:my, t0:performance.now(), maxPts:P.length, travel:0, zoomed:false };
+  }
+  function plGestureMove(){
+    const g = plTouch.gesture; if(!g) return;
+    const P = [...plTouch.pts.values()].filter(p => p.canvas);
+    g.maxPts = Math.max(g.maxPts, P.length);
+    if(P.length < 2) return;
+    const a = P[0], c = P[1];
+    const mx = (a.x + c.x)/2, my = (a.y + c.y)/2;
+    const d = Math.hypot(a.x - c.x, a.y - c.y);
+    g.travel = Math.max(g.travel, Math.hypot(mx - g.mx0, my - g.my0), Math.abs(d - g.d0));
+    const z = Math.max(0.05, Math.min(8, g.z0*d/g.d0));
+    if(Math.abs(z - zoom) > 1e-4){ zoom = z; applyZoom(); g.zoomed = true; }
+    // keep the canvas point that started under the fingers under them
+    const r = zoomOuter.getBoundingClientRect();
+    canvasArea.scrollLeft += (r.left + g.cx*zoom) - mx;
+    canvasArea.scrollTop  += (r.top  + g.cy*zoom) - my;
+  }
+  function plGestureEnd(){
+    const g = plTouch.gesture; if(!g) return;
+    if(plTouch.pts.size) return;                       // wait for every finger
+    plTouch.gesture = null;
+    if(performance.now() - g.t0 < 320 && g.travel < 14){
+      if(g.maxPts === 2){ undo(); toast('Undo'); }
+      else if(g.maxPts >= 3){ redo(); toast('Redo'); }
+    }
+  }
+
+  // ---------------- long press = right-click (on the panels) ----------------
+  function plLongPressArm(e){
+    clearTimeout(plTouch.lp && plTouch.lp.timer);
+    const t0 = performance.now();
+    plTouch.lp = { x:e.clientX, y:e.clientY, target:e.target, src:e, timer: setTimeout(()=>{
+      const lp = plTouch.lp; plTouch.lp = null;
+      if(!lp || plTouch.nativeCM > t0) return;             // the browser already sent one
+      plFire('contextmenu', lp.src, lp.target, 2);
+      plTouch.swallowClick = performance.now();
+    }, 520) };
+  }
+  function plLongPressCancel(){ if(plTouch.lp){ clearTimeout(plTouch.lp.timer); plTouch.lp = null; } }
+
+  // ---------------- hold a layer row to drag it ----------------
+  function plRowArm(e, li){
+    plTouch.rowDrag = { li, id:+li.dataset.id, x:e.clientX, y:e.clientY, live:false, target:null,
+      timer: setTimeout(()=>{ const r = plTouch.rowDrag; if(!r) return; r.live = true; li.classList.add('pl-row-drag'); plLongPressCancel(); }, 300) };
+  }
+  function plRowMove(e){
+    const r = plTouch.rowDrag; if(!r) return false;
+    if(!r.live){ if(Math.hypot(e.clientX - r.x, e.clientY - r.y) > 10){ clearTimeout(r.timer); plTouch.rowDrag = null; } return false; }
+    const over = plUnder(e); const li = over && over.closest && over.closest('#layerList li');
+    if(r.target && r.target !== li) r.target.classList.remove('pl-row-target', 'pl-row-below');
+    r.target = li && li !== r.li ? li : null;
+    if(r.target){
+      const rows = [...document.querySelectorAll('#layerList li')];
+      r.down = rows.indexOf(r.target) > rows.indexOf(r.li);       // dragged down the list: land below it
+      r.target.classList.toggle('pl-row-target', !r.down);
+      r.target.classList.toggle('pl-row-below', r.down);
+    }
+    return true;
+  }
+  // Below a row in the list is under it in the stack.
+  function plMoveBelow(dragId, targetId){
+    const dl = getById(dragId), tl = getById(targetId);
+    if(!dl || !tl || tl.kind === 'group'){ reorderLayer(dragId, targetId); return; }
+    layers.splice(layers.indexOf(dl), 1);
+    layers.splice(layers.indexOf(tl), 0, dl);
+    dl.groupId = tl.groupId || null;
+    refreshLayerList(); scheduleRender(); pushHistory();
+  }
+  function plRowEnd(){
+    const r = plTouch.rowDrag; if(!r) return false;
+    clearTimeout(r.timer); plTouch.rowDrag = null;
+    r.li.classList.remove('pl-row-drag');
+    if(r.target) r.target.classList.remove('pl-row-target', 'pl-row-below');
+    if(r.live && r.target){
+      if(r.down) plMoveBelow(r.id, +r.target.dataset.id); else reorderLayer(r.id, +r.target.dataset.id);
+      plTouch.swallowClick = performance.now();
+    }
+    return r.live;
+  }
+
+  // ---------------- pointer routing ----------------
+  document.addEventListener('pointerdown', (e)=>{
+    if(e.pointerType === 'pen'){
+      plTouch.penAt = performance.now();
+      // Most browsers send mouse events for a pen; if this one does not, bridge it too.
+      if(plTouch.penNative === false && e.target.closest && e.target.closest(PL_BRIDGE) && !plIsControl(e.target)){ e.preventDefault(); plBridgeStart(e, 'pen'); }
+      else if(plTouch.penNative === null) plTouch.penProbe = { e, native:false };
+      return;
+    }
+    if(e.pointerType !== 'touch') return;
+    plTouchMode();
+    plTouch.swallowClick = 0;                                   // a new touch: the old click guard is spent
+    const t = e.target;
+    const canvas = !!(t.closest && t.closest('#canvasArea'));
+    plTouch.pts.set(e.pointerId, { x:e.clientX, y:e.clientY, canvas });
+    plTouch.lastDown = performance.now(); plTouch.lastDownCanvas = canvas;
+    if(plTouch.gesture){ e.preventDefault(); plTouch.gesture.maxPts = Math.max(plTouch.gesture.maxPts, plCanvasTouches()); return; }
+    if(canvas && plCanvasTouches() >= 2){ e.preventDefault(); plGestureStart(); return; }
+    if(plTouch.bridge) return;                                  // a third finger elsewhere: ignore
+    const zone = t.closest && t.closest(PL_BRIDGE);
+    if(!zone || plIsControl(t)){
+      const li = t.closest && t.closest('#layerList li');
+      if(li && !t.closest('button, input, .vis, .att-toggle')) plRowArm(e, li);
+      plLongPressArm(e);
+      return;
+    }
+    // palm resting while the pen draws
+    if(canvas && performance.now() - plTouch.penAt < 900){ e.preventDefault(); return; }
+    e.preventDefault();                                         // we send the mouse events ourselves, now
+    plBridgeStart(e, 'touch');
+  }, { capture:true, passive:false });
+
+  // A pen whose browser does send mouse events shows it on the very first press.
+  document.addEventListener('mousedown', (e)=>{
+    if(plTouch.penProbe && e.isTrusted){ plTouch.penNative = true; plTouch.penProbe = null; }
+  }, true);
+  document.addEventListener('pointerup', (e)=>{
+    if(e.pointerType === 'pen' && plTouch.penProbe){
+      // pressed and released with no mouse events at all: bridge pens from now on
+      setTimeout(()=>{ if(plTouch.penProbe){ plTouch.penNative = false; plTouch.penProbe = null; } }, 0);
+    }
+  }, true);
+
+  document.addEventListener('pointermove', (e)=>{
+    if(e.pointerType === 'pen'){
+      if(plTouch.bridge && plTouch.bridge.id === e.pointerId){ plTouch.bridge.last = e; plFire('mousemove', e, plUnder(e, plTouch.bridge.target), 1); }
+      plTouch.penAt = performance.now();
+      return;
+    }
+    if(e.pointerType !== 'touch') return;
+    const p = plTouch.pts.get(e.pointerId); if(!p) return;
+    p.x = e.clientX; p.y = e.clientY;
+    if(plTouch.gesture){ e.preventDefault(); plGestureMove(); return; }
+    if(plRowMove(e)){ e.preventDefault(); return; }
+    if(plTouch.lp && Math.hypot(e.clientX - plTouch.lp.x, e.clientY - plTouch.lp.y) > 10) plLongPressCancel();
+    const b = plTouch.bridge;
+    if(b && b.id === e.pointerId){ e.preventDefault(); b.last = e; plFire('mousemove', e, plUnder(e, b.target), 1); }
+  }, { capture:true, passive:false });
+
+  // Once a held row is being dragged, the list must not scroll under it (which
+  // would cancel the touch). Before the hold completes, a swipe still scrolls.
+  document.addEventListener('touchmove', (e)=>{
+    if((plTouch.rowDrag && plTouch.rowDrag.live) || plTouch.gesture) e.preventDefault();
+  }, { passive:false });
+
+  function plPointerEnd(e){
+    if(e.pointerType === 'pen'){
+      if(plTouch.bridge && plTouch.bridge.id === e.pointerId) plBridgeEnd(e);
+      plTouch.penAt = performance.now();
+      return;
+    }
+    if(e.pointerType !== 'touch') return;
+    plTouch.pts.delete(e.pointerId);
+    plLongPressCancel();
+    if(plRowEnd()) return;
+    if(plTouch.gesture){ plGestureEnd(); return; }
+    const b = plTouch.bridge;
+    if(b && b.id === e.pointerId) plBridgeEnd(e, e.type === 'pointercancel');
+  }
+  document.addEventListener('pointerup', plPointerEnd, true);
+  document.addEventListener('pointercancel', plPointerEnd, true);
+
+  // A long press on the canvas is not a right-click: it would put the tool down mid-stroke.
+  document.addEventListener('contextmenu', (e)=>{
+    if(e.__plTouch) return;
+    const touchy = e.pointerType === 'touch' || (performance.now() - plTouch.lastDown < 1200 && plTouch.pts.size > 0);
+    if(touchy){
+      plTouch.nativeCM = performance.now();
+      if(plTouch.lastDownCanvas){ e.preventDefault(); e.stopImmediatePropagation(); }
+      else plTouch.swallowClick = performance.now();
+    }
+  }, true);
+  // the click that ends a long press or a row drag is not a click
+  document.addEventListener('click', (e)=>{
+    if(e.isTrusted && plTouch.swallowClick && performance.now() - plTouch.swallowClick < 700){ plTouch.swallowClick = 0; e.preventDefault(); e.stopPropagation(); }
+  }, true);
+  // any new press (mouse and pen too) means the guarded click is not coming
+  document.addEventListener('pointerdown', (e)=>{ if(e.pointerType !== 'touch') plTouch.swallowClick = 0; }, true);
   // <<PL_FEATURES_END>>
 
   // ---------------- Init ----------------
