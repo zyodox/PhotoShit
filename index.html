@@ -32416,18 +32416,45 @@ var PL_BUILD = 'b261009-pro';
     const GROUPS = [
       ['move'], ['crop'], '-',
       ['rect', 'ellipse', 'shapesel'], ['lasso', 'selbrush', 'pen'], ['wand', 'colorsel'], '-',
-      ['type'], '-',
+      ['type'], 'DRAW', '-',
       ['streak'], ['heal', 'clone', 'blend'], ['gradient', 'bucket'], '-',
       ['eyedrop'], ['mask']
     ];
     const AI_TOOLS = ['objsel', 'remove'];
     const main = document.createElement('div');
     main.className = 'tr-main';
-    const known = new Set([].concat(...GROUPS.filter(g => g !== '-'), AI_TOOLS));
+    const known = new Set([].concat(...GROUPS.filter(g => Array.isArray(g)), AI_TOOLS));
     const leftovers = [...rail.querySelectorAll('button[data-tool]')].filter(b => !known.has(b.dataset.tool));
     const groups = [];
+    // Paint Brush and Vector Draw: the Add menu's two drawing entries, here too.
+    // They are modes rather than rail tools, so each lights up while it is on.
+    const drawBtns = [];
+    const drawBtn = (icon, title, run, isOn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.title = title;
+      b.innerHTML = plIcon(icon);
+      b.addEventListener('click', e => { e.stopPropagation(); run(); setTimeout(syncDraw, 0); });
+      b._isOn = isOn;
+      drawBtns.push(b);
+      return b;
+    };
+    const syncDraw = () => drawBtns.forEach(b => {
+      let on = false; try { on = !!b._isOn(); } catch(err){}
+      if(b.classList.contains('active') !== on) b.classList.toggle('active', on);   // no-op writes would re-trigger the observer
+    });
+    ['pointerup', 'keyup'].forEach(t => document.addEventListener(t, () => setTimeout(syncDraw, 0), true));
+    const DRAW = [
+      drawBtn('brush', 'Paint Brush — paint on a paint layer (a new one on top, or the paint layer you have selected). Click again to stop painting',
+        () => { if(drawState) stopDrawMode(); else { const s = $('btnDraw'); if(s) s.click(); } },
+        () => drawState),
+      drawBtn('pen', 'Vector Draw — draw your own shape with the pen, then fill and stroke it like any other',
+        () => { const s = $('btnVectorDraw'); if(s) s.click(); },
+        () => activeTool === 'pen' && pen.mode === 'shape' && !drawState)
+    ];
     for(const g of GROUPS){
       if(g === '-'){ const s = document.createElement('div'); s.className = 'trsep'; main.appendChild(s); continue; }
+      if(g === 'DRAW'){ DRAW.forEach(b => main.appendChild(b)); continue; }
       const btns = g.map(tb).filter(Boolean);
       if(!btns.length) continue;
       if(btns.length === 1){ main.appendChild(btns[0]); continue; }
@@ -32484,6 +32511,7 @@ var PL_BUILD = 'b261009-pro';
 
     // A grouped tool that becomes active (by shortcut or from the flyout) takes the slot.
     const syncGroups = () => {
+      syncDraw();
       for(const box of groups){
         const on = box.querySelector('button.active');
         if(on && !on.classList.contains('tr-cur')){
