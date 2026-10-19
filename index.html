@@ -11894,12 +11894,27 @@ var PL_BUILD = 'b261009-pro';
     return glFitTexture(layer, c, 'blur' + blur);
   }
 
+  // Every canvas a layer hands the GPU gets its own number, so a different
+  // picture is always a different texture.
+  const glArtIds = new WeakMap();
+  let glArtNext = 1;
+  function glArtId(c){
+    if(!c || typeof c !== 'object') return 0;
+    let id = glArtIds.get(c);
+    if(!id){ id = glArtNext++; glArtIds.set(c, id); }
+    return id;
+  }
   function glArtKey(layer, art){
     if(layer.kind === 'text' || layer.kind === 'shape') return layer._glArtKey;
+    // The art itself and the settings as they are now: _adjKey only changes when
+    // an effect is computed, so switching an effect back to None (which computes
+    // nothing) used to leave the texture showing the effect.
+    const f = liveFilters(layer);
+    const now = f ? pixelAdjustKey(f) + '/' + stylizeKey(f) : '-';
     // Both adjustment keys have to be here. getDrawSource() returns a low-res proxy
     // while the user is mid-drag and caches its result under _adjKeyLo; watching
     // only _adjKey means the texture never refreshes for the whole drag.
-    return [layer._bmpV||0, layer._adjKey||'', layer._adjKeyLo||'',
+    return [layer._bmpV||0, layer._adjKey||'', layer._adjKeyLo||'', now, 'art' + glArtId(art),
             layer.adjustEnabled === false ? 'A0' : 'A1',
             fillsKey(layer), layer._recolorKey || '-',
             liveFilters(layer) ? liveFilters(layer).blur : 0,
@@ -13129,7 +13144,7 @@ var PL_BUILD = 'b261009-pro';
     if(l.kind === 'image' || l.kind === 'sticker' || l.kind === 'draw'){
       const adjOff = l.adjustEnabled === false ? 'A0' : 'A1';
       const p = l.paint;
-      if(p && p.on) return ['b',l._bmpV||0,l._adjKey||'',adjOff,fillsKey(l),l.flipX,l.flipY,
+      if(p && p.on) return ['b',l._bmpV||0,adjNowKey(l),adjOff,fillsKey(l),l.flipX,l.flipY,
                             'fill',p.type,p.keepShading?1:0,l.color,paintKey(l),
                             p.type === 'gradient' ? gradKey(gradOfPaint(p)) : '-',
                             l.lmask ? (l._lmaskV||0) : '-'].join('|');
@@ -13165,8 +13180,13 @@ var PL_BUILD = 'b261009-pro';
                                          (p.hx||0).toFixed(4)+','+(p.hy||0).toFixed(4)).join(';')
                                      : '-',
                                    paintKey(l),fillsKey(l)].join('|');
-    return ['b', l._bmpV||0, l._adjKey||'', (l.adjustEnabled===false?'A0':'A1'), fillsKey(l), l.flipX?1:0, l.flipY?1:0,
+    return ['b', l._bmpV||0, adjNowKey(l), (l.adjustEnabled===false?'A0':'A1'), fillsKey(l), l.flipX?1:0, l.flipY?1:0,
             l.lmask ? (l._lmaskV||0)+':'+(l.lmaskEnabled===false?0:1)+':'+(l.lmaskInvert?1:0)+':'+(l.lmaskFeather||0)+':'+(l.lmaskDensity==null?100:l.lmaskDensity) : '-'].join('|');
+  }
+  // A pixel layer's adjustments as they are set now (not as last computed).
+  function adjNowKey(l){
+    const f = liveFilters(l);
+    return f && (hasPixelAdjust(f) || hasStylize(f)) ? pixelAdjustKey(f) + '/' + stylizeKey(f) : '-';
   }
   function layerThumb(layer){
     // Nothing to preview: an adjustment layer owns no artwork, only a recipe.
