@@ -32334,6 +32334,278 @@ var PL_BUILD = 'b261009-pro';
   }, true);
   // any new press (mouse and pen too) means the guarded click is not coming
   document.addEventListener('pointerdown', (e)=>{ if(e.pointerType !== 'touch') plTouch.swallowClick = 0; }, true);
+  // ================================================================
+  // ==============  LAYOUT: TOOL RAIL AND PANEL SECTIONS  ==========
+  // A tidier arrangement of what is already there, done at start-up so every
+  // control keeps its id, its handlers and its place in the tests:
+  //  - the tool rail groups related tools into one slot each (Photoshop-style:
+  //    the last one used shows; hold, right-click or the corner mark lists the
+  //    rest), so it fits in one column without scrolling;
+  //  - every AI feature sits together in one column pinned to the bottom of the
+  //    rail -- the duplicates elsewhere (the floating task bar, the selection
+  //    bar's AI buttons, the Cut Out tab, AI Upscale in the Canvas menu) are
+  //    hidden, their buttons kept so the rail can press them;
+  //  - property panels fold into sections, remembered between sessions.
+  // Self-contained, so build\classic.js adds it to the no-timeline build too.
+  // ================================================================
+  (function plLayout(){
+    const rail = document.getElementById('toolRail');
+    if(!rail || rail.dataset.plLayout) return;
+    rail.dataset.plLayout = '1';
+    const $ = id => document.getElementById(id);
+    const tb = t => rail.querySelector('button[data-tool="' + t + '"]');
+
+    const css = document.createElement('style');
+    css.textContent = [
+      // Rail: a scrolling column of tools, and the AI block pinned underneath.
+      '.tool-rail{overflow:hidden; padding:8px 0 0; gap:0;}',
+      '.tr-main{flex:1 1 auto; min-height:0; width:100%; display:flex; flex-direction:column; align-items:center; gap:2px;',
+      '  overflow-y:auto; overscroll-behavior:contain; scrollbar-width:none; padding-bottom:8px;}',
+      '.tr-main::-webkit-scrollbar{display:none;}',
+      '.tr-grp{position:relative; flex:0 0 auto; width:36px; height:36px;}',
+      '.tr-grp > button{display:none;}',
+      'html.pl-touch .tr-grp{width:44px; height:44px;}',
+      '.tr-grp > button.tr-cur{display:flex;}',
+      // The corner mark: this slot holds more than one tool.
+      '.tr-grp::after{content:""; position:absolute; right:3px; bottom:3px; width:0; height:0; pointer-events:none;',
+      '  border-left:4px solid transparent; border-bottom:4px solid var(--muted); opacity:.75;}',
+      '.tr-grp .tr-more{position:absolute; right:0; bottom:0; width:13px; height:13px; z-index:1; cursor:pointer; border-radius:0 0 7px 0;}',
+      '.tr-grp .tr-more:hover{background:rgba(255,255,255,.08);}',
+      '.tool-rail button:focus-visible, .tr-fly button:focus-visible{outline:2px solid var(--accent); outline-offset:1px;}',
+      '.tool-rail button:active{transform:scale(.96);}',
+      '.tool-rail button{transition:background-color .15s ease, color .15s ease, border-color .15s ease;}',
+      '.tool-rail button:disabled{opacity:.45; cursor:not-allowed;}',
+      // AI block.
+      '.tr-ai{flex:0 0 auto; width:100%; display:flex; flex-direction:column; align-items:center; gap:2px;',
+      '  padding:8px 0; border-top:1px solid var(--line); background:linear-gradient(180deg, rgba(76,141,255,.07), rgba(76,141,255,0));}',
+      '.tr-ai-h{display:flex; align-items:center; gap:2px; height:16px; margin-bottom:4px; font-size:9.5px; font-weight:700;',
+      '  letter-spacing:.08em; color:var(--accent); user-select:none;}',
+      '.tr-ai-h svg.ic{width:11px; height:11px;}',
+      '.tr-ai button svg.ic{color:var(--accent);}',
+      '.tr-ai button:hover svg.ic{color:#fff;}',
+      // Flyout listing a group\'s tools.
+      '.tr-fly{position:fixed; z-index:1000; min-width:220px; padding:4px; background:var(--panel); border:1px solid var(--border);',
+      '  border-radius:8px; box-shadow:0 0 0 1px rgba(0,0,0,.35), 0 8px 24px rgba(0,0,0,.35); display:flex; flex-direction:column; gap:2px;}',
+      '.tr-fly[hidden]{display:none;}',
+      '.tr-fly button{display:flex; align-items:center; gap:8px; height:32px; padding:0 8px; width:100%; justify-content:flex-start;',
+      '  background:transparent; border:1px solid transparent; border-radius:6px; color:var(--text); font-size:12.5px; text-align:left;}',
+      '.tr-fly button:hover{background:var(--surface);}',
+      '.tr-fly button.on{background:var(--accent-dim); border-color:rgba(76,141,255,.35);}',
+      '.tr-fly button svg.ic{width:17px; height:17px; flex:0 0 auto; color:var(--icon);}',
+      '.tr-fly button.on svg.ic{color:var(--accent);}',
+      '.tr-fly .k{margin-left:auto; color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums;}',
+      // The AI features live in the rail now; their old homes are hidden.
+      '#layerTaskBar{display:none !important;}',
+      '#selectBar #btnSelSubject, #selectBar #btnSelRemove, #selectBar #btnSelRemove + .sep{display:none !important;}',
+      '#canvasMenu #btnUpscale{display:none !important;}',
+      '#tabRail .tab[data-tab="cutout"]{display:none !important;}',
+      // Foldable panel sections.
+      '.pl-sec{display:block;}',
+      '.pl-sec > .sub{cursor:pointer; user-select:none; justify-content:flex-start; gap:6px;}',
+      '.pl-sec > .sub > .mini-reset{margin-left:auto;}',
+      '.pl-sec > .sub::before{content:""; width:0; height:0; border-left:4px solid transparent; border-right:4px solid transparent;',
+      '  border-top:5px solid var(--muted); transition:transform .15s ease; flex:0 0 auto;}',
+      '.pl-sec.collapsed > .sub::before{transform:rotate(-90deg);}',
+      '.pl-sec > .sub:hover{color:var(--text);}',
+      '.pl-sec > .sub:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:3px;}',
+      '.pl-sec.collapsed > .pl-sec-body{display:none;}'
+    ].join('\n');
+    document.head.appendChild(css);
+
+    // ---------------- tool groups ----------------
+    const GROUPS = [
+      ['move'], ['crop'], '-',
+      ['rect', 'ellipse', 'shapesel'], ['lasso', 'selbrush', 'pen'], ['wand', 'colorsel'], '-',
+      ['type'], '-',
+      ['streak'], ['heal', 'clone', 'blend'], ['gradient', 'bucket'], '-',
+      ['eyedrop'], ['mask']
+    ];
+    const AI_TOOLS = ['objsel', 'remove'];
+    const main = document.createElement('div');
+    main.className = 'tr-main';
+    const known = new Set([].concat(...GROUPS.filter(g => g !== '-'), AI_TOOLS));
+    const leftovers = [...rail.querySelectorAll('button[data-tool]')].filter(b => !known.has(b.dataset.tool));
+    const groups = [];
+    for(const g of GROUPS){
+      if(g === '-'){ const s = document.createElement('div'); s.className = 'trsep'; main.appendChild(s); continue; }
+      const btns = g.map(tb).filter(Boolean);
+      if(!btns.length) continue;
+      if(btns.length === 1){ main.appendChild(btns[0]); continue; }
+      const box = document.createElement('div');
+      box.className = 'tr-grp';
+      btns.forEach(b => box.appendChild(b));
+      btns[0].classList.add('tr-cur');
+      const more = document.createElement('span');
+      more.className = 'tr-more';
+      more.title = 'More tools';
+      box.appendChild(more);
+      main.appendChild(box);
+      groups.push(box);
+    }
+    leftovers.forEach(b => main.appendChild(b));           // anything added later still shows
+
+    // The AI column.
+    const ai = document.createElement('div');
+    ai.className = 'tr-ai';
+    ai.innerHTML = '<div class="tr-ai-h" title="Everything that runs the built-in AI">' + plIcon('sparkle') + 'AI</div>';
+    AI_TOOLS.map(tb).filter(Boolean).forEach(b => ai.appendChild(b));
+    // Actions: each presses the original control, so behaviour (and its
+    // "make a selection first" style messages) stays exactly as it was.
+    const act = (icon, title, run, mirror) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.title = title;
+      b.innerHTML = plIcon(icon);
+      b.addEventListener('click', e => { e.stopPropagation(); if(!b.disabled) run(); });
+      const src = mirror && $(mirror);
+      if(src){
+        const sync = () => { b.disabled = !!src.disabled; };
+        new MutationObserver(sync).observe(src, { attributes:true, attributeFilter:['disabled'] });
+        sync();
+      }
+      ai.appendChild(b);
+      return b;
+    };
+    const press = id => () => { const s = $(id); if(s) s.click(); };
+    act('subject-sel', 'Select Subject — the AI finds the main subject of the active layer and selects it', press('btnTaskSubject'), 'btnTaskSubject');
+    act('remove-bg', 'Remove Background — the AI masks out everything but the subject, as an editable layer mask', press('btnTaskRemoveBg'), 'btnTaskRemoveBg');
+    act('eraser', 'Remove Selected — the AI erases what is inside the selection and fills the space in', press('btnSelRemove'));
+    act('scissors', 'Cut Out — background removal with refine edge, decontaminate colours and touch-up brushes', () => {
+      const l = getSelected();
+      if(typeof isAiLayer === 'function' && isAiLayer(l) && typeof openEraseOverlay === 'function') openEraseOverlay(l);
+      else setTab('cutout');
+    });
+    act('upscale', 'AI Upscale — enlarge with the built-in AI, which draws in real detail instead of blurring', press('btnUpscale'));
+
+    // Rebuild the rail: tools, then AI.
+    [...rail.childNodes].forEach(n => n.remove());
+    rail.appendChild(main);
+    rail.appendChild(ai);
+
+    // A grouped tool that becomes active (by shortcut or from the flyout) takes the slot.
+    const syncGroups = () => {
+      for(const box of groups){
+        const on = box.querySelector('button.active');
+        if(on && !on.classList.contains('tr-cur')){
+          box.querySelectorAll('button.tr-cur').forEach(b => b.classList.remove('tr-cur'));
+          on.classList.add('tr-cur');
+        }
+      }
+    };
+    new MutationObserver(syncGroups).observe(main, { subtree:true, attributes:true, attributeFilter:['class'] });
+    syncGroups();
+
+    // ---------------- flyout ----------------
+    const fly = document.createElement('div');
+    fly.className = 'tr-fly';
+    fly.hidden = true;
+    fly.setAttribute('role', 'menu');
+    document.body.appendChild(fly);
+    const nameOf = b => (b.title || '').split(/\s+—\s+|\s{2}\(/)[0].trim();
+    const keyOf = b => { const m = (b.title || '').match(/\(([^()]{1,14})\)/); return m ? m[1] : ''; };
+    let flyFor = null;
+    const closeFly = () => { fly.hidden = true; flyFor = null; };
+    const openFly = (box) => {
+      fly.innerHTML = '';
+      for(const b of box.querySelectorAll('button[data-tool]')){
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.setAttribute('role', 'menuitem');
+        row.className = b.classList.contains('active') ? 'on' : '';
+        const ic = b.querySelector('svg.ic');
+        row.innerHTML = (ic ? ic.outerHTML : '') + '<span></span><span class="k"></span>';
+        row.children[1].textContent = nameOf(b);
+        row.querySelector('.k').textContent = keyOf(b);
+        row.title = b.title;
+        row.addEventListener('click', () => { closeFly(); b.click(); });
+        fly.appendChild(row);
+      }
+      const r = box.getBoundingClientRect();
+      fly.hidden = false;
+      const h = fly.offsetHeight;
+      fly.style.left = Math.round(r.right + 6) + 'px';
+      fly.style.top = Math.round(Math.max(8, Math.min(window.innerHeight - h - 8, r.top - 4))) + 'px';
+      flyFor = box;
+      const first = fly.querySelector('button.on') || fly.querySelector('button');
+      if(first) first.focus({ preventScroll:true });
+    };
+    for(const box of groups){
+      box.querySelector('.tr-more').addEventListener('click', e => { e.stopPropagation(); flyFor === box ? closeFly() : openFly(box); });
+      box.addEventListener('contextmenu', e => { e.preventDefault(); openFly(box); });
+      // Press and hold, as in every desktop editor.
+      let hold = 0;
+      box.addEventListener('pointerdown', e => {
+        if(e.button !== 0 || e.target.classList.contains('tr-more')) return;
+        clearTimeout(hold);
+        hold = setTimeout(() => { hold = 0; openFly(box); }, 380);
+      });
+      const cancel = () => { clearTimeout(hold); hold = 0; };
+      box.addEventListener('pointerup', cancel);
+      box.addEventListener('pointerleave', cancel);
+      box.addEventListener('pointercancel', cancel);
+    }
+    document.addEventListener('pointerdown', e => { if(flyFor && !fly.contains(e.target) && !flyFor.contains(e.target)) closeFly(); }, true);
+    document.addEventListener('keydown', e => {
+      if(fly.hidden) return;
+      if(e.key === 'Escape'){ e.preventDefault(); e.stopPropagation(); const box = flyFor; closeFly(); const c = box && box.querySelector('.tr-cur'); if(c) c.focus(); }
+      else if(e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+        e.preventDefault();
+        const rows = [...fly.querySelectorAll('button')], i = rows.indexOf(document.activeElement);
+        rows[(i + (e.key === 'ArrowDown' ? 1 : rows.length - 1)) % rows.length].focus();
+      }
+    }, true);
+    window.addEventListener('resize', closeFly);
+
+    // ---------------- foldable panel sections ----------------
+    let folded = {};
+    try { folded = JSON.parse(localStorage.getItem('pl.ui.folded') || 'null') || { 'transform:Distort':1, 'transform:Align to Canvas':1 }; } catch(err){}
+    const saveFolds = () => { try { localStorage.setItem('pl.ui.folded', JSON.stringify(folded)); } catch(err){} };
+    // A heading owns the siblings after it, up to the next heading or to a
+    // block that has headings of its own (a wrapper like #geomOnly), so the
+    // sections nest the way the panel is already laid out.
+    const isHead = n => n.classList && n.classList.contains('sub');
+    const hasHead = n => n.querySelector && !!n.querySelector('.sub');
+    document.querySelectorAll('#props .pane').forEach(pane => {
+     const parents = new Set([...pane.querySelectorAll('.sub')].map(s => s.parentNode));
+     for(const parent of parents){
+      if(parent.closest('.ls-item, #labParams')) continue;          // built and rebuilt by their own code
+      const kids = [...parent.children];
+      for(let i = 0; i < kids.length; i++){
+        const head = kids[i];
+        if(!isHead(head)) continue;
+        const body = [];
+        for(let j = i + 1; j < kids.length && !isHead(kids[j]) && !hasHead(kids[j]); j++) body.push(kids[j]);
+        if(!body.length) continue;
+        const sec = document.createElement('div');
+        sec.className = 'pl-sec';
+        const inner = document.createElement('div');
+        inner.className = 'pl-sec-body';
+        parent.insertBefore(sec, head);
+        sec.appendChild(head);
+        body.forEach(n => inner.appendChild(n));
+        sec.appendChild(inner);
+        // The heading's own text, without anything a panel puts on its right.
+        const key = pane.dataset.pane + ':' + ((head.firstChild && head.firstChild.nodeType === 3 ? head.firstChild.textContent : head.textContent) || '').trim();
+        if(folded[key]) sec.classList.add('collapsed');
+        head.tabIndex = 0;
+        head.setAttribute('role', 'button');
+        head.setAttribute('aria-expanded', String(!folded[key]));
+        const toggle = (e) => {
+          if(e && e.target.closest('a, button, input, select, label')) return;   // a control in the heading
+          const c = sec.classList.toggle('collapsed');
+          head.setAttribute('aria-expanded', String(!c));
+          if(c) folded[key] = 1; else delete folded[key];
+          saveFolds();
+        };
+        head.addEventListener('click', toggle);
+        head.addEventListener('keydown', e => { if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); } });
+        i += body.length;
+      }
+     }
+    });
+    // Tests, and anything that needs every control on screen.
+    window.plUnfoldAll = () => document.querySelectorAll('.pl-sec.collapsed').forEach(s => s.classList.remove('collapsed'));
+  })();
   // <<PL_FEATURES_END>>
 
   // ---------------- Init ----------------
