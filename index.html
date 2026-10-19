@@ -9649,7 +9649,7 @@ var PL_BUILD = 'b261009-pro';
     const key = [iw, ih, p.type, p.keepShading?1:0, layer.color, paintKey(layer),
                  p.type === 'gradient' ? gradKey(gradOfPaint(p)) : '-', fillsKey(layer),
                  layer._bmpV||0, layer._adjKey||'', layer._adjKeyLo||''].join('|');
-    if(layer._recolorArt && layer._recolorKey === key) return layer._recolorArt;
+    if(layer._recolorArt && layer._recolorKey === key && layer._recolorSrc === src) return layer._recolorArt;
 
     const c = makeClearCanvas(iw, ih);
     const cc = c.getContext('2d');
@@ -9666,7 +9666,7 @@ var PL_BUILD = 'b261009-pro';
       cc.drawImage(src, 0, 0, iw, ih);
     }
     cc.globalCompositeOperation = 'source-over';
-    layer._recolorArt = c; layer._recolorKey = key;
+    layer._recolorArt = c; layer._recolorKey = key; layer._recolorSrc = src;
     return c;
   }
 
@@ -10316,7 +10316,7 @@ var PL_BUILD = 'b261009-pro';
   function warpContentKey(layer){
     const f = liveFilters(layer);
     return [layer._bmpV||0, layer._vecArtKey||'', thumbTag(layer),
-            f ? gradeKeyOf(f) + ',' + f.blur + ',' + f.vignette : '-',
+            f ? gradeKeyOf(f) + ',' + f.blur + ',' + f.vignette + ',' + pixelAdjustKey(f) + ',' + stylizeKey(f) : '-',
             layer.adjustEnabled === false ? 'A0' : 'A1', glMaskKey(layer)].join('|');
   }
 
@@ -11824,12 +11824,15 @@ var PL_BUILD = 'b261009-pro';
     const h = Math.max(1, Math.floor(src.height*k));
     const key = [layer._bmpV||0, layer._adjKey||'', layer._adjKeyLo||'', tag,
                  src.width+'x'+src.height, w+'x'+h].join('|');
-    if(layer._glFit && layer._glFitKey === key) return layer._glFit;
+    // Tied to the very canvas it was made from as well: the key only names the
+    // adjustment state as of its last rebuild, so a drag preview or an older
+    // result could otherwise be shown again after the slider moved.
+    if(layer._glFit && layer._glFitKey === key && layer._glFitSrc === src) return layer._glFit;
     const c = makeClearCanvas(w, h);
     const cc = c.getContext('2d');
     cc.imageSmoothingQuality = 'high';
     cc.drawImage(src, 0, 0, w, h);
-    layer._glFit = c; layer._glFitKey = key;
+    layer._glFit = c; layer._glFitKey = key; layer._glFitSrc = src;
     return c;
   }
 
@@ -11879,13 +11882,15 @@ var PL_BUILD = 'b261009-pro';
     // Blur is the one CSS filter that is not a per-pixel function, so it is baked
     // into the art and re-done only when the radius or the bitmap changes.
     const key = (layer._bmpV||0) + '|' + (layer._adjKey||'') + '|blur' + blur;
-    if(layer._glBlur && layer._glBlurKey === key) return layer._glBlur;
+    // Same source canvas too: a blur baked from the low-res drag preview stayed
+    // on screen after the drag, since the key never saw the difference.
+    if(layer._glBlur && layer._glBlurKey === key && layer._glBlurSrc === src) return layer._glBlur;
     const c = makeClearCanvas(src.width, src.height);
     const cc = c.getContext('2d');
     cc.filter = 'blur(' + blur + 'px)';
     cc.drawImage(src, 0, 0);
     cc.filter = 'none';
-    layer._glBlur = c; layer._glBlurKey = key;
+    layer._glBlur = c; layer._glBlurKey = key; layer._glBlurSrc = src;
     return glFitTexture(layer, c, 'blur' + blur);
   }
 
@@ -26237,6 +26242,8 @@ var PL_BUILD = 'b261009-pro';
                 _shadow:{enabled:true, dx:0, dy:1, blur:0, color:'#ffffff', opacity:0.45} }
   };
   var lsOpen = new Set(), lsHost = null;
+  // Layer id -> effects the user has switched off by hand (see autoOn).
+  var lsUserOff = new Map();
   function lsEsc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]); }
   function lsBuild(){
     lsHost = document.getElementById('lsHost');
@@ -26296,6 +26303,12 @@ var PL_BUILD = 'b261009-pro';
           const fx = ensureFx(l);
           fx[key][k] = read();
           if(k === 'on' && fx[key].on){ lsOpen.add(key); item.classList.add('open'); }
+          // Remember an effect the user switched off themselves, so autoOn leaves it off.
+          if(k === 'on'){
+            const off = lsUserOff.get(l.id) || new Set();
+            if(fx[key].on) off.delete(key); else off.add(key);
+            lsUserOff.set(l.id, off);
+          }
           item.classList.toggle('on', !!fx[key].on);
           scheduleRender();
         };
@@ -26303,9 +26316,12 @@ var PL_BUILD = 'b261009-pro';
         else if(el.type === 'color'){ el.addEventListener('input', ()=>{ apply(); autoOn(); }); el.addEventListener('change', commit); }
         else { el.addEventListener('change', ()=>{ apply(); if(k !== 'on') autoOn(); render(); commit(); }); }
         // Touching any setting of an effect that is off switches it on: nobody
-        // drags a stroke's size wanting to see nothing happen.
+        // drags a stroke's size wanting to see nothing happen. Unless the user
+        // switched it off themselves: then sliding a setting back must not quietly
+        // bring the effect back, which looked like the picture not updating.
         function autoOn(){
           const l = cur(); if(!l || !l.fx || l.fx[key].on) return;
+          if((lsUserOff.get(l.id) || new Set()).has(key)) return;
           l.fx[key].on = true; lsSync();
         }
         if(el.classList.contains('bslider')) el.addEventListener('input', autoOn);
