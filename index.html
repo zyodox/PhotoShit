@@ -32354,6 +32354,172 @@ var PL_BUILD = 'b261009-pro';
   }, true);
   // any new press (mouse and pen too) means the guarded click is not coming
   document.addEventListener('pointerdown', (e)=>{ if(e.pointerType !== 'touch') plTouch.swallowClick = 0; }, true);
+
+
+  // ================================================================
+  // ==============  BAKE EFFECTS  ==================================
+  // A layer carries one Stylize style, one Shader Lab effect, one overlay and
+  // one grade at a time. Bake writes everything the Effects panels are doing to
+  // the layer into its pixels and resets those panels, so the next style or
+  // shader goes on top of the last -- as many as you like, each one baked in
+  // turn. The layer keeps its place and size; its layer mask, drop shadow,
+  // glow, blend mode and opacity stay live, since they are not pixels of its own.
+  // Self-contained, so build\classic.js adds it to the no-timeline build too.
+  // ================================================================
+  (function(){
+    // Anything the Effects panels would change about this layer's pixels.
+    function bakeHasWork(l){
+      const f = l.filters;
+      return !!(f && (!isNeutralFilter(f) || f.vignette > 0 || hasPixelAdjust(f) || hasStylize(f)))
+          || (l.fills || []).some(x => x.enabled !== false && x.mask)
+          || !!(l.paint && l.paint.on);
+    }
+
+    function bakeLayer(l){
+      if(!l){ toast('Select a layer to bake.'); return false; }
+      if(l.kind === 'adjust'){ toast('An adjustment layer grades what is under it; it has no pixels of its own to bake.'); return false; }
+      if(!hasGeometry(l)){ toast('Groups cannot be baked: bake the layers inside.'); return false; }
+      if(l.adjustEnabled === false){ toast('This layer\'s effects are switched off, so there is nothing to bake.'); return false; }
+      if(!bakeHasWork(l)){ toast('Nothing to bake yet: give the layer an effect first.'); return false; }
+
+      const { w, h } = layerSize(l);
+      const vector = l.kind === 'text' || l.kind === 'shape';
+      const sx = Math.abs(l.scaleX || 1), sy = Math.abs(l.scaleY || 1);
+      let qx, qy;
+      if(vector){
+        // As Rasterize does: at the size it is shown, on a grid square on screen.
+        const g = Math.sqrt(sx*sy), q = Math.max(1, Math.min(8, Math.max(sx, sy)));
+        qx = q*sx/g; qy = q*sy/g;
+      } else {
+        // A bitmap layer at its own full resolution, not the working copy.
+        if(l.kind !== 'draw'){ l._fullRes = true; rebuildOffscreen(l); }
+        const bmp = l.kind === 'draw' ? l.drawCanvas : l.offscreen;
+        if(!bmp || !bmp.width){ toast('This layer has no pixels to bake.'); return false; }
+        qx = bmp.width / w; qy = bmp.height / h;
+      }
+
+      // Room for whatever the effects paint past the layer's edge: a motion
+      // smear, a dream glow, an overlay's sparkles, a blur, a stroke.
+      const f = l.filters || {};
+      const reach = (stylizeReach(f) + (f.blur || 0)*3) / Math.max(1e-3, Math.min(sx, sy));
+      const ap = vector ? artPad(l) : { x: 0, y: 0 };
+      const pad = { x: Math.max(ap.x, reach), y: Math.max(ap.y, reach) };
+      const cap = (GL && GL.maxTex) ? Math.min(8192, GL.maxTex) : 4096;
+      const d = bufferDims(w, h, pad, qx, qy, cap);
+
+      // Drawn through the same chain the canvas uses, at full quality: no drag
+      // preview, no proxy, the mip level of this buffer.
+      const full = makeClearCanvas(d.bw, d.bh);
+      const fx = full.getContext('2d');
+      fx.imageSmoothingQuality = 'high';
+      fx.setTransform(d.qx, 0, 0, d.qy, pad.x*d.qx, pad.y*d.qy);
+      const prevOut = renderOutScale, prevExp = exporting;
+      renderOutScale = d.qx / (sx || 1);
+      exporting = true;
+      try { drawLayerArt(fx, l, w, h, 'source-over'); }
+      catch(err){ console.error(err); toast('Bake failed: ' + (err && err.message || err)); return false; }
+      finally { renderOutScale = prevOut; exporting = prevExp; }
+
+      // Keep the union of the layer's box and the ink, so nothing the effects
+      // painted past the edge is lost and the layer only grows when it must.
+      let ink = null;
+      try { ink = alphaBounds(full); } catch(err){ ink = null; }
+      const bx0 = Math.floor(pad.x*d.qx), by0 = Math.floor(pad.y*d.qy);
+      const bx1 = Math.ceil((pad.x + w)*d.qx), by1 = Math.ceil((pad.y + h)*d.qy);
+      const cx0 = Math.max(0, ink ? Math.min(bx0, ink.x - 1) : bx0);
+      const cy0 = Math.max(0, ink ? Math.min(by0, ink.y - 1) : by0);
+      const cx1 = Math.min(d.bw, ink ? Math.max(bx1, ink.x + ink.w + 1) : bx1);
+      const cy1 = Math.min(d.bh, ink ? Math.max(by1, ink.y + ink.h + 1) : by1);
+      const cw = Math.max(1, cx1 - cx0), ch = Math.max(1, cy1 - cy0);
+      const c = makeClearCanvas(cw, ch);
+      c.getContext('2d').drawImage(full, cx0, cy0, cw, ch, 0, 0, cw, ch);
+
+      // The new box in the old layer's local units, and its centre on the
+      // canvas through the old transform, where the new centre has to land.
+      const L = cx0/d.qx - pad.x, T = cy0/d.qy - pad.y;
+      const LW = cw/d.qx, LH = ch/d.qy;
+      const C = layerUVToCanvas(l, (L + LW/2)/w, (T + LH/2)/h);
+
+      // The layer mask stays live: carry it into the new box.
+      if(l.lmask){
+        const cv = l.lmask;
+        const NW = Math.max(1, Math.round(cv.width * LW / w)), NH = Math.max(1, Math.round(cv.height * LH / h));
+        const ox = (-L/LW)*NW, oy = (-T/LH)*NH, iw = (w/LW)*NW, ih = (h/LH)*NH;
+        l.lmask = cloneCanvas(extendedMask(cv, NW, NH, ox, oy, iw, ih));
+        bumpMask(l);
+      }
+
+      // The pixels are the look now: the effects start again from nothing.
+      const oldSx = l.scaleX, oldSy = l.scaleY;
+      l.kind = 'image';
+      l.drawCanvas = null;
+      l.srcCanvas = c;
+      l.mask = null;
+      l.cropRect = { x: 0, y: 0, w: cw, h: ch };
+      l.naturalW = cw; l.naturalH = ch;
+      l._fullRes = true;
+      l.filters = defaultFilters();
+      l.fills = [];
+      if(l.paint) l.paint.on = false;
+      // Keyframes on the settings just baked would bring them straight back.
+      if(l.keys){
+        const next = {};
+        Object.keys(l.keys).forEach(p => { if(!/^(filters|paint|fills)\./.test(p)) next[p] = l.keys[p]; });
+        l.keys = Object.keys(next).length ? next : null;
+      }
+      rebuildOffscreen(l, cw);
+      l.scaleX = oldSx * LW / cw;
+      l.scaleY = oldSy * LH / ch;
+      l.x = C.x - (cw*l.scaleX)/2;
+      l.y = C.y - (ch*l.scaleY)/2;
+      ['_vecArt', '_vecArtKey', '_vecLRU', '_featherArt', '_featherKey', '_featherLRU', '_glArt', '_glArtKey', '_warpArt', '_warpKey',
+       '_thumb', '_thumbTag', '_adjCache', '_adjKey', '_adjCacheLo', '_adjKeyLo', '_fillsArt', '_fillsKey', '_fillsSrc',
+       '_wandArt', '_wandKey', '_bloomSrc', '_bloomSrcKey', '_bloomArt', '_bloomKey'].forEach(k => { l[k] = null; });
+      l._bmpV = nextVer();
+      return true;
+    }
+
+    function bakeSelected(){
+      const l = getSelected();
+      if(bakeLayer(l)){
+        refreshLayerList(); refreshProps(); render(); pushHistory();
+        toast('Effects baked into the layer. Add the next one on top.');
+      }
+    }
+
+    // A bar at the top of every panel that sets effects.
+    const css = document.createElement('style');
+    css.textContent = [
+      '.pl-bake{display:flex; align-items:center; gap:8px; margin:0 0 10px; padding:8px; border:1px solid var(--line, rgba(255,255,255,.12)); border-radius:8px; background:rgba(255,255,255,.03);}',
+      '.pl-bake button{flex:0 0 auto; font-weight:600;}',
+      '.pl-bake small{flex:1 1 auto; color:var(--muted); font-size:11px; line-height:1.3;}'
+    ].join('\n');
+    document.head.appendChild(css);
+    ['paneLight', 'paneColor', 'paneEffects', 'paneStylize', 'paneLab'].forEach(id => {
+      const pane = document.getElementById(id);
+      if(!pane) return;
+      const bar = document.createElement('div');
+      bar.className = 'pl-bake';
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pl-bake-btn';
+      b.textContent = 'Bake effects';
+      b.title = 'Write this layer\'s effects into its pixels and reset them, so another effect can go on top (Ctrl+Alt+B)';
+      b.addEventListener('click', bakeSelected);
+      const s = document.createElement('small');
+      s.textContent = 'Apply these effects to the layer, then stack another on top.';
+      bar.appendChild(b); bar.appendChild(s);
+      pane.insertBefore(bar, pane.firstChild);
+    });
+    document.addEventListener('keydown', e => {
+      if(!(e.ctrlKey || e.metaKey) || !e.altKey || e.shiftKey || (e.key || '').toLowerCase() !== 'b') return;
+      const t = e.target;
+      if(t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+      e.preventDefault();
+      bakeSelected();
+    });
+    window.plBakeLayer = bakeSelected;
+  })();
   // ================================================================
   // ==============  LAYOUT: TOOL RAIL AND PANEL SECTIONS  ==========
   // A tidier arrangement of what is already there, done at start-up so every
