@@ -5011,7 +5011,16 @@ var PL_BUILD = 'b261009-pro';
     ["2:3", 2/3], ["16:9", 16/9], ["9:16", 9/16], ["21:9", 21/9], ["9:21", 9/21]
   ];
   const SYSTEM_FONTS = ["Segoe UI","Arial","Georgia","Times New Roman","Courier New","Verdana","Trebuchet MS","Impact","Comic Sans MS"];
-  const MAX_IMPORT_DIM = 4000; // clamp huge imports for performance/stability
+  // Imports are brought down to this on their longest side. Every open photo holds
+  // several full-size bitmaps (source, mask, working copy, the stage), so a phone,
+  // or a machine that says it is short of memory, works smaller: past what the
+  // device can hold, the browser kills the tab.
+  const MAX_IMPORT_DIM = (()=>{
+    const mem = navigator.deviceMemory || 8;
+    let phone = false;
+    try { phone = matchMedia('(pointer:coarse)').matches && Math.min(screen.width, screen.height) < 820; } catch(e){}
+    return phone || mem <= 2 ? 2048 : mem <= 4 ? 3000 : 4000;
+  })();
   const MAX_HISTORY = 60;
 
   let canvasW = 1200, canvasH = 800;
@@ -15689,26 +15698,13 @@ var PL_BUILD = 'b261009-pro';
 
   function loadImageFile(file, cb){
     if(isSvgFile(file)){ loadSvgFile(file, cb); return; }
-    const reader = new FileReader();
-    reader.onload = ()=>{
-      const img = new Image();
-      img.onload = ()=>{
-        if(img.naturalWidth > MAX_IMPORT_DIM || img.naturalHeight > MAX_IMPORT_DIM){
-          const scale = MAX_IMPORT_DIM / Math.max(img.naturalWidth, img.naturalHeight);
-          const c = document.createElement('canvas');
-          c.width = Math.round(img.naturalWidth*scale); c.height = Math.round(img.naturalHeight*scale);
-          c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-          const scaled = new Image();
-          scaled.onload = ()=> cb(scaled);
-          scaled.src = c.toDataURL('image/png');
-          toast('Large image downscaled to '+c.width+'×'+c.height+' for performance.');
-        } else cb(img);
-      };
-      img.onerror = ()=> toast('Could not read that image file.');
-      img.src = reader.result;
-    };
-    reader.onerror = ()=> toast('Could not read that file.');
-    reader.readAsDataURL(file);
+    // Straight from the file: a data URL would hold a second, base64 copy of it.
+    // Anything too big is brought down by openCropOverlay, whatever decoded it.
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = ()=>{ URL.revokeObjectURL(url); cb(img); };
+    img.onerror = ()=>{ URL.revokeObjectURL(url); toast('Could not read that image file.'); };
+    img.src = url;
   }
 
   // Shapes now live in the shared Add menu. Each entry is drawn by the same
@@ -16645,9 +16641,26 @@ var PL_BUILD = 'b261009-pro';
       fullW = srcCanvas.width; fullH = srcCanvas.height;
       initRect = {...opts.layer.cropRect};
     } else {
-      srcCanvas = document.createElement('canvas');
-      srcCanvas.width = opts.img.naturalWidth; srcCanvas.height = opts.img.naturalHeight;
-      srcCanvas.getContext('2d').drawImage(opts.img, 0, 0);
+      // Every decoder (photo, SVG, 16-bit PNG/TIFF) comes through here, so this is
+      // where an over-size import is brought down to MAX_IMPORT_DIM. A canvas that
+      // already fits is a private copy made for this import and is used as it is,
+      // rather than held twice.
+      const img = opts.img;
+      const nw = img.naturalWidth || img.width, nh = img.naturalHeight || img.height;
+      const k = Math.min(1, MAX_IMPORT_DIM / Math.max(nw, nh));
+      if(k === 1 && img instanceof HTMLCanvasElement) srcCanvas = img;
+      else {
+        srcCanvas = document.createElement('canvas');
+        srcCanvas.width = Math.max(1, Math.round(nw*k)); srcCanvas.height = Math.max(1, Math.round(nh*k));
+        const sx = srcCanvas.getContext('2d');
+        sx.imageSmoothingQuality = 'high';
+        sx.drawImage(img, 0, 0, srcCanvas.width, srcCanvas.height);
+        if(k < 1) toast('Large image downscaled to '+srcCanvas.width+'×'+srcCanvas.height+' for performance.');
+        // The decoded photo is not needed again: let the browser drop it now
+        // rather than whenever the crop dialog's references go.
+        if(img instanceof HTMLImageElement){ img.removeAttribute('src'); }
+        else if(img instanceof HTMLCanvasElement && !img.__svg){ img.width = img.height = 0; }
+      }
       fullW = srcCanvas.width; fullH = srcCanvas.height;
       initRect = {x:0, y:0, w:fullW, h:fullH};
     }
@@ -25472,12 +25485,17 @@ var PL_BUILD = 'b261009-pro';
     AI.sess.alpha = r.alpha; AI.sess.rgba = r.rgba || null; AI.sess.detail = m.detail;
     return AI.sess;
   }
-  // Once a photo is open, unpack the built-in model and compile it in the
-  // background: the first run's shader build is most of the wait, and it is
-  // better spent before the click than after it.
+  // With a photo open in the Cut Out tab, unpack the built-in model and compile
+  // it in the background: the first run's shader build is most of the wait, and
+  // it is better spent before the click than after it.
   let aiWarmed = false;
   function aiMaybeWarm(){
     if(aiWarmed || !PLMatte.supported() || !PLMatte.available() || !navigator.gpu) return;
+    // The model is a 95 MB download and about a gigabyte once compiled. That is
+    // worth doing ahead of the click only once someone is in the Cut Out tab, on
+    // a machine with memory to spare; anywhere else it waits for the click.
+    if(activeTab !== 'cutout' || (navigator.deviceMemory || 8) < 8) return;
+    try { if(matchMedia('(pointer:coarse)').matches) return; } catch(e){}
     aiWarmed = true;
     const go = ()=> PLMatte.warm().catch(()=>{});
     if(window.requestIdleCallback) requestIdleCallback(go, { timeout:4000 }); else setTimeout(go, 1500);
@@ -25787,6 +25805,7 @@ var PL_BUILD = 'b261009-pro';
     aiSyncPane(); syncLayerTaskBar();
     if(isAiLayer(getSelected())) aiMaybeWarm();
   };
+  tabRail.addEventListener('click', ()=>{ if(isAiLayer(getSelected())) aiMaybeWarm(); });
 
   // ---- the options strip names the tool in hand ----
   const TOOL_META = {
